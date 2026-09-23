@@ -1,248 +1,232 @@
-# 🐋 Docker MCP server
+# 🐋 Docker MCP Server
 
-An MCP server for managing Docker with natural language!
+A production-grade, harness-agnostic [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for managing and inspecting Docker containers, images, volumes, and networks.
 
-## 🪩 What can it do?
+Compatible with any MCP-compliant client: **Google Antigravity**, **Claude Desktop**, **Cursor**, **VS Code Copilot**, **Gemini CLI**, and more.
 
-- 🚀 Compose containers with natural language
-- 🔍 Introspect & debug running containers
-- 📀 Manage persistent data with Docker volumes
+---
 
-## ❓ Who is this for?
+## 🌟 Key Features & Hardening
 
-- Server administrators: connect to remote Docker engines for e.g. managing a
-  public-facing website.
-- Tinkerers: run containers locally and experiment with open-source apps
-  supporting Docker.
-- AI enthusiasts: push the limits of that an LLM is capable of!
+- **Harness-Agnostic Stdio Compliance**: Strict separation of communication channels — all internal logging and diagnostics route to `stderr`, keeping `stdout` purely for JSON-RPC MCP messages to prevent client crashes.
+- **Defensive Docker Socket Auto-Detection**:
+  1. `DOCKER_SOCKET_PATH` environment variable
+  2. `DOCKER_HOST` environment variable (supporting `unix://`, `tcp://`, etc.)
+  3. `/var/run/docker.sock`
+  4. `~/.docker/run/docker.sock` (standard Docker Desktop on macOS)
+  5. `$XDG_RUNTIME_DIR/docker.sock` (Linux rootless Docker)
+- **Resilient Error Handling**: Never crashes the stdio process when Docker Desktop is stopped or socket permissions are missing. Returns clean, human-readable errors with `isError: true`.
+- **Stream Demultiplexing**: Cleanly separates stdout and stderr in `docker_container_logs` and `docker_exec`, stripping raw 8-byte Docker multiplexing headers (`\x01\x00\x00...`) so binary frame headers never corrupt log output.
+- **Null-Guarded Data Mapping**: Eliminates crashes when containers have null or empty port lists (internal networks, host-networked, or stopped containers).
 
-## Demo
+---
 
-A quick demo showing a WordPress deployment using natural language:
+## 🚀 Quickstart
 
-https://github.com/user-attachments/assets/65e35e67-bce0-4449-af7e-9f4dd773b4b3
+### Prerequisites
+- Docker Engine or Docker Desktop installed and running
+- Python 3.12+ and [uv](https://docs.astral.sh/uv/) installed
 
-## 🏎️ Quickstart
+---
 
-### Install
+## ⚙️ Client Configurations
 
-#### Claude Desktop
+### 1. Google Antigravity (`~/.gemini/config/mcp_config.json`)
 
-On MacOS: `~/Library/Application\ Support/Claude/claude_desktop_config.json`
+To use this local server repository directly with Antigravity:
 
-On Windows: `%APPDATA%/Claude/claude_desktop_config.json`
-
-<details>
-  <summary>Install from PyPi with uv</summary>
-
-If you don't have `uv` installed, follow the installation instructions for your
-system:
-[link](https://docs.astral.sh/uv/getting-started/installation/#installation-methods)
-
-Then add the following to your MCP servers file:
-
-```
-"mcpServers": {
-  "mcp-server-docker": {
-    "command": "uvx",
-    "args": [
-      "mcp-server-docker"
-    ]
-  }
-}
-```
-
-</details>
-
-<details>
-  <summary>Install with Docker</summary>
-
-Purely for convenience, the server can run in a Docker container.
-
-After cloning this repository, build the Docker image:
-
-```bash
-docker build -t mcp-server-docker .
-```
-
-And then add the following to your MCP servers file:
-
-```
-"mcpServers": {
-  "mcp-server-docker": {
-    "command": "docker",
-    "args": [
-      "run",
-      "-i",
-      "--rm",
-      "-v",
-      "/var/run/docker.sock:/var/run/docker.sock",
-      "mcp-server-docker:latest"
-    ]
-  }
-}
-```
-
-Note that we mount the Docker socket as a volume; this ensures the MCP server
-can connect to and control the local Docker daemon.
-
-</details>
-
-## 📝 Prompts
-
-### 🎻 `docker_compose`
-
-Use natural language to compose containers. [See above](#demo) for a demo.
-
-Provide a Project Name, and a description of desired containers, and let the LLM
-do the rest.
-
-This prompt instructs the LLM to enter a `plan+apply` loop. Your interaction
-with the LLM will involve the following steps:
-
-1. You give the LLM instructions for which containers to bring up
-2. The LLM calculates a concise natural language plan and presents it to you
-3. You either:
-   - Apply the plan
-   - Provide the LLM feedback, and the LLM recalculates the plan
-
-#### Examples
-
-- name: `nginx`, containers: "deploy an nginx container exposing it on port
-  9000"
-- name: `wordpress`, containers: "deploy a WordPress container and a supporting
-  MySQL container, exposing Wordpress on port 9000"
-
-#### Resuming a Project
-
-When starting a new chat with this prompt, the LLM will receive the status of
-any containers, volumes, and networks created with the given project `name`.
-
-This is mainly useful for cleaning up, in-case you lose a chat that was
-responsible for many containers.
-
-## 📔 Resources
-
-The server exposes resource templates rather than enumerating currently-running containers:
-
-- `docker://containers/{container_id}/logs` (`text/plain`)
-- `docker://containers/{container_id}/stats` (`application/json`)
-
-Read either URI with a Docker container ID or name.
-
-## 🔨 Tools
-
-### Containers
-
-- `list_containers`
-- `create_container`
-- `run_container`
-- `recreate_container`
-- `start_container`
-- `fetch_container_logs`
-- `stop_container`
-- `remove_container`
-
-### Images
-
-- `list_images`
-- `pull_image`
-- `push_image`
-- `build_image`
-- `remove_image`
-
-### Networks
-
-- `list_networks`
-- `create_network`
-- `remove_network`
-
-### Volumes
-
-- `list_volumes`
-- `create_volume`
-- `remove_volume`
-
-## 🚧 Disclaimers
-
-### Sensitive Data
-
-**DO NOT CONFIGURE CONTAINERS WITH SENSITIVE DATA.** This includes API keys,
-database passwords, etc.
-
-Any sensitive data exchanged with the LLM is inherently compromised, unless the
-LLM is running on your local machine.
-
-If you are interested in securely passing secrets to containers, file an issue
-on this repository with your use-case.
-
-### Reviewing Created Containers
-
-Be careful to review the containers that the LLM creates. Docker is not a secure
-sandbox, and therefore the MCP server can potentially impact the host machine
-through Docker.
-
-For safety reasons, this MCP server doesn't support sensitive Docker options
-like `--privileged` or `--cap-add/--cap-drop`. If these features are of interest
-to you, file an issue on this repository with your use-case.
-
-## 🛠️ Configuration
-
-This server uses the Python Docker SDK's `from_env` method. For configuration
-details, see
-[the documentation](https://docker-py.readthedocs.io/en/stable/client.html#docker.client.from_env).
-
-### Connect to Docker over SSH
-
-This MCP server can connect to a remote Docker daemon over SSH.
-
-Simply set a `ssh://` host URL in the MCP server definition:
-
-```
-"mcpServers": {
-  "mcp-server-docker": {
-    "command": "uvx",
-    "args": [
-      "mcp-server-docker"
-    ],
-    "env": {
-      "DOCKER_HOST": "ssh://myusername@myhost.example.com"
+```json
+{
+  "mcpServers": {
+    "docker": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/Users/dachyan/dev/repos/mcp-server-docker",
+        "run",
+        "mcp-server-docker"
+      ],
+      "env": {
+        "DOCKER_SOCKET_PATH": "/Users/dachyan/.docker/run/docker.sock"
+      }
     }
   }
 }
 ```
 
-## 💻 Development
+Or using `uvx` directly:
 
-Prefer using Devbox to configure your development environment. The server uses
-MCP Python SDK v2's high-level `MCPServer` API and can be inspected directly:
-
-```bash
-uv sync --all-groups
-uv run mcp dev src/mcp_server_docker/server.py:app
-# or: npx @modelcontextprotocol/inspector uv run mcp-server-docker
+```json
+{
+  "mcpServers": {
+    "docker": {
+      "command": "uvx",
+      "args": ["mcp-server-docker"]
+    }
+  }
+}
 ```
 
-Run the hermetic test and lint suite without a Docker daemon:
+---
+
+### 2. Claude Desktop
+
+Configuration file path:
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "docker": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/mcp-server-docker",
+        "run",
+        "mcp-server-docker"
+      ]
+    }
+  }
+}
+```
+
+---
+
+### 3. Cursor (`.cursor/mcp.json` or Cursor Settings)
+
+Add to `.cursor/mcp.json` in your workspace or global Cursor settings:
+
+```json
+{
+  "mcpServers": {
+    "docker": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/mcp-server-docker",
+        "run",
+        "mcp-server-docker"
+      ]
+    }
+  }
+}
+```
+
+---
+
+### 4. Running with Docker Container
+
+You can also run the MCP server inside a lightweight Docker container, sharing the host Docker socket:
 
 ```bash
+# Build the image
+docker build -t mcp-server-docker .
+```
+
+Then configure your MCP client:
+
+```json
+{
+  "mcpServers": {
+    "docker": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-v",
+        "/var/run/docker.sock:/var/run/docker.sock",
+        "mcp-server-docker:latest"
+      ]
+    }
+  }
+}
+```
+
+---
+
+## 🛠️ Tool Reference
+
+### Standardized Tools
+
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| **`docker_list_containers`** | `all` (boolean, optional, default: false) | Formatted markdown table listing container ID, names, image, state, status, and ports. |
+| **`docker_container_logs`** | `id` (string, required)<br>`tail` (number, default: 100)<br>`timestamps` (boolean, default: false) | Fetches container logs with demultiplexed stdout and stderr, cleanly stripped of Docker 8-byte framing headers. |
+| **`docker_container_action`** | `id` (string, required)<br>`action` (`start` \| `stop` \| `restart` \| `remove`)<br>`timeout` (number, optional)<br>`force` (boolean, default: false) | Executes container lifecycle actions safely. |
+| **`docker_exec`** | `id` (string, required)<br>`command` (array of strings, e.g. `["ls", "-la"]`)<br>`working_dir` (string, optional) | Executes commands non-interactively inside a running container, returning stdout, stderr, and exit code. |
+| **`docker_list_images`** | `all` (boolean, optional, default: false) | Lists Docker images with ID, repository, tag, human-readable size, and created timestamp. |
+| **`docker_system_info`** | None | Quick healthcheck returning Docker engine version, API version, OS, Arch, CPUs, memory, and container status counts. |
+
+### Container Lifecycle & Management Tools
+
+| Tool | Description |
+| :--- | :--- |
+| `start_container` | Start an existing container by ID or name. |
+| `stop_container` | Stop a running container by ID or name. |
+| `create_container` | Create a container with custom networks, ports, environments, and volumes. |
+| `run_container` | Create and start a container in one step. |
+| `recreate_container` | Stop, remove, and recreate a container with updated configurations. |
+| `remove_container` | Remove a container (with optional force). |
+| `fetch_container_logs` | Structured line-by-line container logs. |
+
+### Images, Networks, & Volumes
+
+- **Images**: `list_images`, `pull_image`, `push_image`, `build_image`, `remove_image`
+- **Networks**: `list_networks`, `create_network`, `remove_network`
+- **Volumes**: `list_volumes`, `create_volume`, `remove_volume`
+
+### Prompts
+
+- **`docker_compose`**: Natural language Docker Compose manager implementing a safe `plan + apply` loop for container infrastructure orchestration.
+
+---
+
+## 🔧 Development & Testing
+
+```bash
+# Install dependencies
+uv sync
+
+# Run the test suite
 uv run pytest
-uv run ruff format --check src tests
-uv run ruff check src tests
+
+# Check code formatting & linting
+uv run ruff check
+
+# Run the MCP server over stdio
+uv run mcp-server-docker
 ```
 
-See the `devbox.json` for helpful development commands.
+---
 
-After setting up devbox you can configure your Claude MCP config to use it:
+## 🩺 Troubleshooting
 
-```
-  "docker": {
-    "command": "/path/to/repo/.devbox/nix/profile/default/bin/uv",
-    "args": [
-      "--directory",
-      "/path/to/repo/",
-      "run",
-      "mcp-server-docker"
-    ]
-  },
-```
+### Docker Daemon Unreachable
+If the server reports `Docker daemon is unreachable`:
+1. Ensure Docker Desktop or the Docker daemon is running:
+   ```bash
+   docker info
+   ```
+2. If using Docker Desktop on macOS, ensure the socket is linked or set `DOCKER_SOCKET_PATH`:
+   ```bash
+   export DOCKER_SOCKET_PATH="${HOME}/.docker/run/docker.sock"
+   ```
+
+### Permission Denied
+If the server reports `Docker permission denied`:
+- On Linux: Add your user to the `docker` group:
+  ```bash
+  sudo usermod -aG docker $USER
+  ```
+- Check socket permissions:
+  ```bash
+  ls -la /var/run/docker.sock ~/.docker/run/docker.sock
+  ```
+
+---
+
+## 📄 License
+
+GPL-3.0 License. See [LICENSE](LICENSE) for details.

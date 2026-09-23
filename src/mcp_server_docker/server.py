@@ -1,26 +1,182 @@
-"""MCPServer v2 implementation for Docker."""
+"""MCPServer v2 implementation for Docker with hardened, harness-agnostic support."""
 
+import functools
 import json
+import logging
+import os
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 import docker
+import docker.errors
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from mcp_server_docker._version import __version__
-from mcp_server_docker.output_schemas import docker_to_dict
+from mcp_server_docker.output_schemas import (
+    demux_docker_stream,
+    docker_to_dict,
+    format_size,
+)
+
+# Configure logging strictly to stderr. Never write to stdout.
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("mcp_server_docker")
+
+
+def format_docker_error(error: Exception, socket_path: str | None = None) -> str:
+    """Format Docker connection, socket, or API errors into clear, human-readable messages."""
+    err_str = str(error)
+    sock_info = f" (attempted socket: {socket_path})" if socket_path else ""
+
+    if (
+        isinstance(error, PermissionError)
+        or "permission denied" in err_str.lower()
+        or "errno 13" in err_str.lower()
+    ):
+        return (
+            f"Docker permission denied{sock_info}. "
+            "Please verify that your user has permission to access the Docker socket "
+            "(e.g. check socket permissions, or ensure the MCP client process has socket access)."
+        )
+
+    if (
+        isinstance(error, (FileNotFoundError, ConnectionError))
+        or "connect enoent" in err_str.lower()
+        or "no such file or directory" in err_str.lower()
+        or "connection refused" in err_str.lower()
+        or "error while fetching server api version" in err_str.lower()
+        or "errno 2" in err_str.lower()
+        or "errno 61" in err_str.lower()
+        or "errno 111" in err_str.lower()
+    ):
+        return (
+            f"Docker daemon is unreachable{sock_info}. "
+            "Please verify that Docker Desktop (or the Docker engine) is running."
+        )
+
+    return f"Docker error: {err_str}"
+
+
+def resolve_docker_client() -> tuple[docker.DockerClient | None, str, str | None]:
+    """
+    Auto-detect Docker socket and return (client, socket_or_host_path, error_message).
+    Priority:
+    1. DOCKER_SOCKET_PATH environment variable
+    2. docker.from_env() (picks up DOCKER_HOST, standard env, or test monkeypatch)
+    3. Auto-detected candidates:
+       - /var/run/docker.sock
+       - ~/.docker/run/docker.sock (macOS Docker Desktop)
+       - $XDG_RUNTIME_DIR/docker.sock (Linux rootless)
+    """
+    # 1. Custom explicit socket path
+    socket_path = os.environ.get("DOCKER_SOCKET_PATH")
+    if socket_path:
+        try:
+            client = docker.DockerClient(base_url=f"unix://{socket_path}")
+            return client, socket_path, None
+        except Exception as e:  # noqa: BLE001
+            logger.error("Failed to connect to DOCKER_SOCKET_PATH %s: %s", socket_path, e)
+            return None, socket_path, format_docker_error(e, socket_path)
+
+    # 2. Try docker.from_env() (supports DOCKER_HOST and test fixtures)
+    try:
+        client = docker.from_env()
+        # Derive socket path or host for diagnostics
+        host = os.environ.get("DOCKER_HOST") or "/var/run/docker.sock"
+        return client, host, None
+    except Exception as env_err:  # noqa: BLE001
+        logger.debug("docker.from_env() failed: %s, checking fallback sockets", env_err)
+
+    # 3. Candidate sockets on macOS / Linux
+    home = os.path.expanduser("~")
+    candidates = [
+        "/var/run/docker.sock",
+        os.path.join(home, ".docker", "run", "docker.sock"),
+    ]
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg_runtime:
+        candidates.append(os.path.join(xdg_runtime, "docker.sock"))
+
+    chosen_candidate = None
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            try:
+                client = docker.DockerClient(base_url=f"unix://{candidate}")
+                return client, candidate, None
+            except Exception as e:  # noqa: BLE001
+                chosen_candidate = candidate
+                logger.debug("Failed candidate socket %s: %s", candidate, e)
+
+    fallback_path = chosen_candidate or "/var/run/docker.sock"
+    error_msg = format_docker_error(
+        FileNotFoundError(f"No active Docker socket found. Attempted {fallback_path}"),
+        fallback_path,
+    )
+    return None, fallback_path, error_msg
 
 
 @dataclass
 class AppContext:
     """State made available to handlers for one running server."""
 
-    docker: docker.DockerClient
+    docker: docker.DockerClient | None
+    socket_path: str = "/var/run/docker.sock"
+    error: str | None = None
+
+
+def _client(ctx: Context[AppContext]) -> docker.DockerClient:
+    app_ctx = ctx.request_context.lifespan_context
+    if app_ctx.error or app_ctx.docker is None:
+        raise ToolError(
+            app_ctx.error
+            or f"Docker daemon is unreachable (socket: {app_ctx.socket_path}). "
+            "Please ensure Docker Desktop is running."
+        )
+    return app_ctx.docker
+
+
+def handle_docker_errors(fn):
+    """Decorator to catch Docker API errors and format them as clean ToolErrors."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        ctx: Context[AppContext] | None = None
+        for arg in args:
+            if isinstance(arg, Context):
+                ctx = arg
+                break
+        socket_path = (
+            ctx.request_context.lifespan_context.socket_path
+            if ctx
+            and hasattr(ctx.request_context, "lifespan_context")
+            and ctx.request_context.lifespan_context
+            else None
+        )
+        try:
+            return fn(*args, **kwargs)
+        except ToolError:
+            raise
+        except docker.errors.NotFound as e:
+            raise ToolError(f"Resource not found: {e.explanation or str(e)}") from e
+        except docker.errors.APIError as e:
+            raise ToolError(f"Docker API error: {e.explanation or str(e)}") from e
+        except docker.errors.DockerException as e:
+            raise ToolError(format_docker_error(e, socket_path)) from e
+        except Exception as e:
+            raise ToolError(format_docker_error(e, socket_path)) from e
+
+    return wrapper
 
 
 class ListContainersFilters(BaseModel):
@@ -68,28 +224,58 @@ ContainerLabels = Annotated[
 AutoRemove = Annotated[bool, Field(description="Automatically remove the container")]
 
 
-def _client(ctx: Context[AppContext]) -> docker.DockerClient:
-    return ctx.request_context.lifespan_context.docker
-
-
 @asynccontextmanager
 async def lifespan(_: MCPServer[AppContext]) -> AsyncIterator[AppContext]:
-    """Create and close the Docker client for one server lifetime."""
-    client = docker.from_env()
+    """Create and manage the Docker client with defensive error handling."""
+    client, socket_path, err = resolve_docker_client()
+    app_ctx = AppContext(docker=client, socket_path=socket_path, error=err)
     try:
-        yield AppContext(docker=client)
+        yield app_ctx
     finally:
-        client.close()
+        if app_ctx.docker:
+            try:
+                app_ctx.docker.close()
+            except Exception as close_err:  # noqa: BLE001
+                logger.debug("Error closing Docker client: %s", close_err)
 
 
 app = MCPServer("docker-server", version=__version__, lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Resources & Prompts
+# ---------------------------------------------------------------------------
+
+
+@app.resource(
+    "docker://containers/{container_id}/logs",
+    name="Container logs",
+    description="Live logs for a container",
+    mime_type="text/plain",
+)
+def container_logs(container_id: str, ctx: Context) -> str:
+    container = _client(ctx).containers.get(container_id)
+    raw = container.logs(tail=100)
+    stdout, stderr = demux_docker_stream(raw)
+    return stdout or stderr or ""
+
+
+@app.resource(
+    "docker://containers/{container_id}/stats",
+    name="Container stats",
+    description="Live resource usage stats for a container",
+    mime_type="application/json",
+)
+def container_stats(container_id: str, ctx: Context) -> dict[str, Any]:
+    container = _client(ctx).containers.get(container_id)
+    return container.stats(stream=False)
 
 
 @app.prompt(
     name="docker_compose", description="Treat the LLM like a Docker Compose manager"
 )
 def docker_compose(ctx: Context, name: str, containers: str) -> str:
-    client = ctx.request_context.lifespan_context.docker
+    client = _client(ctx)
     project_label = f"mcp-server-docker.project={name}"
     existing_containers = client.containers.list(filters={"label": project_label})
     volumes = client.volumes.list(filters={"label": project_label})
@@ -147,7 +333,6 @@ I will be assisting with deploying Docker containers for project: `{name}`.
 I will run in a plan+apply loop when you request changes to the project. This is
 to ensure that you are aware of the changes I am about to make, and to give you
 the opportunity to ask questions or make tweaks.
-
 Instruct me to apply immediately (without confirming the plan with you) when you desire to do so.
 
 ## Commands
@@ -177,60 +362,269 @@ N. ...
 Respond `apply` to apply this plan. Otherwise, provide feedback and I will present you with an updated plan.
 <END FORMAT>
 
-Always apply a plan in dependency order. For example, if you are creating a container that depends on a
-database, create the database first, and abort the apply if dependency creation fails. Likewise, 
-destruction should occur in the reverse dependency order, and be aborted if destroying a particular resource fails.
-
-Plans should only create, update, or destroy resources in the project. Relatedly, "recreate" should
-be used to indicate a destroy followed by a create; always prefer udpating a resource when possible,
-only recreating it if required (e.g. for immutable resources like containers).
-
-If the project already exists (as indicated by the presence of resources above) and your plan would
-produce no changes, simply respond with "No changes to make; project is up-to-date." If the user requests
-changes that would render a resource obsolete (e.g. an unused volume), you should destroy the resource.
-
-If you produce a plan and the next user message is not `apply`, simply drop the plan and inform
-the user that they must explicitly include "apply" in the message. Only
-apply a plan if it is contained in your latest message, otherwise ask the user to provide
-their desires for the new plan.
-
-IMPORTANT: maintain brevvity throughout your responses, unless instructed to be verbose.
-
-The following are guidelines for you to follow when interacting with Docker Tools:
-
-- Always prefer `run_container` for starting a container, instead of `create_container`+`start_container`.
-- Always prefer `recreate_container` for updating a container, instead of `stop_container`+`remove_container`+`run_container`.
+Always apply a plan in dependency order.
 """
 
 
-@app.resource(
-    "docker://containers/{container_id}/logs",
-    name="Container logs",
-    description="Live logs for a container",
-    mime_type="text/plain",
-)
-def container_logs(container_id: str, ctx: Context) -> str:
-    container = ctx.request_context.lifespan_context.docker.containers.get(container_id)
-    return container.logs(tail=100).decode("utf-8")
-
-
-@app.resource(
-    "docker://containers/{container_id}/stats",
-    name="Container stats",
-    description="Live resource usage stats for a container",
-    mime_type="application/json",
-)
-def container_stats(container_id: str, ctx: Context) -> dict[str, Any]:
-    container = ctx.request_context.lifespan_context.docker.containers.get(container_id)
-    return container.stats(stream=False)
+# ---------------------------------------------------------------------------
+# Standardized Docker MCP Tools
+# ---------------------------------------------------------------------------
 
 
 @app.tool(
-    description="List all Docker containers",
+    description="List all Docker containers with ID, names, image, state, status, and ports",
     annotations=ToolAnnotations(
         read_only_hint=True, idempotent_hint=True, open_world_hint=False
     ),
 )
+@handle_docker_errors
+def docker_list_containers(
+    ctx: Context[AppContext],
+    all: Annotated[
+        bool, Field(description="Show all containers (default shows just running)")
+    ] = False,
+) -> str:
+    containers = _client(ctx).containers.list(all=all)
+    if not containers:
+        return "No containers found." + ("" if all else " (Use all=True to view stopped containers.)")
+
+    headers = ["CONTAINER ID", "NAMES", "IMAGE", "STATE", "STATUS", "PORTS"]
+    rows: list[list[str]] = []
+    for c in containers:
+        d = docker_to_dict(c)
+        rows.append([
+            d["short_id"],
+            d["name"],
+            d["image_name"],
+            d["state"],
+            d["status"],
+            d["ports_formatted"],
+        ])
+
+    col_widths = [len(h) for h in headers]
+    for r in rows:
+        for i, val in enumerate(r):
+            col_widths[i] = max(col_widths[i], len(val))
+
+    header_line = " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
+    separator_line = "-|-".join("-" * col_widths[i] for i in range(len(headers)))
+    row_lines = [" | ".join(r[i].ljust(col_widths[i]) for i in range(len(headers))) for r in rows]
+
+    return f"| {header_line} |\n| {separator_line} |\n" + "\n".join(f"| {l} |" for l in row_lines)
+
+
+@app.tool(
+    description="Fetch and demultiplex stdout and stderr logs for a Docker container",
+    annotations=ToolAnnotations(
+        read_only_hint=True, idempotent_hint=True, open_world_hint=False
+    ),
+)
+@handle_docker_errors
+def docker_container_logs(
+    ctx: Context[AppContext],
+    id: Annotated[str, Field(description="Container ID or name")],
+    tail: Annotated[
+        int | Literal["all"], Field(description="Number of lines to show from the end")
+    ] = 100,
+    timestamps: Annotated[
+        bool, Field(description="Show timestamps in logs")
+    ] = False,
+) -> str:
+    container = _client(ctx).containers.get(id)
+    raw = container.logs(
+        stdout=True,
+        stderr=True,
+        stream=False,
+        tail=tail,
+        timestamps=timestamps,
+    )
+    stdout, stderr = demux_docker_stream(raw)
+    if stdout and stderr:
+        return f"=== STDOUT ===\n{stdout}\n=== STDERR ===\n{stderr}".strip()
+    elif stderr and not stdout:
+        return f"=== STDERR ===\n{stderr}".strip()
+    elif stdout:
+        return stdout.strip()
+    return "(No log output)"
+
+
+@app.tool(
+    description="Perform a lifecycle action on a container: start, stop, restart, or remove",
+    annotations=ToolAnnotations(
+        destructive_hint=True, idempotent_hint=False, open_world_hint=False
+    ),
+)
+@handle_docker_errors
+def docker_container_action(
+    ctx: Context[AppContext],
+    id: Annotated[str, Field(description="Container ID or name")],
+    action: Annotated[
+        Literal["start", "stop", "restart", "remove"],
+        Field(description="Action to perform: 'start', 'stop', 'restart', or 'remove'"),
+    ],
+    timeout: Annotated[
+        int | None,
+        Field(description="Timeout in seconds before stopping/restarting"),
+    ] = None,
+    force: Annotated[
+        bool, Field(description="Force remove container (applicable to remove action)")
+    ] = False,
+) -> dict[str, Any]:
+    container = _client(ctx).containers.get(id)
+    if action == "start":
+        container.start()
+        return {"status": "started", "id": id}
+    elif action == "stop":
+        if timeout is not None:
+            container.stop(timeout=timeout)
+        else:
+            container.stop()
+        return {"status": "stopped", "id": id}
+    elif action == "restart":
+        if timeout is not None:
+            container.restart(timeout=timeout)
+        else:
+            container.restart()
+        return {"status": "restarted", "id": id}
+    elif action == "remove":
+        container.remove(force=force)
+        return {"status": "removed", "id": id}
+    else:
+        raise ToolError(f"Unsupported action '{action}'")
+
+
+@app.tool(
+    description="Execute a command non-interactively inside a running container",
+    annotations=ToolAnnotations(
+        destructive_hint=False, idempotent_hint=False, open_world_hint=False
+    ),
+)
+@handle_docker_errors
+def docker_exec(
+    ctx: Context[AppContext],
+    id: Annotated[str, Field(description="Container ID or name")],
+    command: Annotated[
+        list[str],
+        Field(description="Command and arguments to execute, e.g. ['ls', '-la']"),
+    ],
+    working_dir: Annotated[
+        str | None,
+        Field(description="Working directory inside the container"),
+    ] = None,
+) -> dict[str, Any]:
+    container = _client(ctx).containers.get(id)
+    exec_result = container.exec_run(
+        cmd=command,
+        workdir=working_dir,
+        demux=True,
+    )
+    stdout, stderr = demux_docker_stream(exec_result.output)
+    output_parts = [f"Exit Code: {exec_result.exit_code}"]
+    if stdout:
+        output_parts.append(f"STDOUT:\n{stdout}")
+    if stderr:
+        output_parts.append(f"STDERR:\n{stderr}")
+
+    return {
+        "exit_code": exec_result.exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "output": "\n\n".join(output_parts).strip(),
+    }
+
+
+@app.tool(
+    description="List Docker images with ID, repository, tag, size, and created date",
+    annotations=ToolAnnotations(
+        read_only_hint=True, idempotent_hint=True, open_world_hint=False
+    ),
+)
+@handle_docker_errors
+def docker_list_images(
+    ctx: Context[AppContext],
+    all: Annotated[
+        bool, Field(description="Show all images (default hides intermediate)")
+    ] = False,
+) -> str:
+    images = _client(ctx).images.list(all=all)
+    if not images:
+        return "No images found."
+
+    headers = ["IMAGE ID", "REPOSITORY", "TAG", "SIZE", "CREATED"]
+    rows: list[list[str]] = []
+    for img in images:
+        d = docker_to_dict(img)
+        tags = d.get("repo_tags") or d.get("tags") or []
+        if tags:
+            for t in tags:
+                parts = t.rsplit(":", 1)
+                repo = parts[0]
+                tag = parts[1] if len(parts) > 1 else "<none>"
+                rows.append([d["short_id"], repo, tag, d["size_formatted"], str(d["created"])[:19]])
+        else:
+            rows.append([d["short_id"], "<none>", "<none>", d["size_formatted"], str(d["created"])[:19]])
+
+    col_widths = [len(h) for h in headers]
+    for r in rows:
+        for i, val in enumerate(r):
+            col_widths[i] = max(col_widths[i], len(val))
+
+    header_line = " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
+    separator_line = "-|-".join("-" * col_widths[i] for i in range(len(headers)))
+    row_lines = [" | ".join(r[i].ljust(col_widths[i]) for i in range(len(headers))) for r in rows]
+
+    return f"| {header_line} |\n| {separator_line} |\n" + "\n".join(f"| {l} |" for l in row_lines)
+
+
+@app.tool(
+    description="Quick healthcheck returning Docker version, OS, container counts, and daemon status",
+    annotations=ToolAnnotations(
+        read_only_hint=True, idempotent_hint=True, open_world_hint=False
+    ),
+)
+@handle_docker_errors
+def docker_system_info(ctx: Context[AppContext]) -> dict[str, Any]:
+    client = _client(ctx)
+    app_ctx = ctx.request_context.lifespan_context
+    v = client.version() or {}
+    info = client.info() or {}
+
+    total_c = info.get("Containers", 0)
+    running_c = info.get("ContainersRunning", 0)
+    paused_c = info.get("ContainersPaused", 0)
+    stopped_c = info.get("ContainersStopped", 0)
+
+    return {
+        "status": "connected",
+        "socket_path": app_ctx.socket_path,
+        "docker_version": v.get("Version", "unknown"),
+        "api_version": v.get("ApiVersion", "unknown"),
+        "os": f"{info.get('OperatingSystem', v.get('Os', 'unknown'))} ({info.get('Architecture', v.get('Arch', 'unknown'))})",
+        "kernel_version": v.get("KernelVersion", "unknown"),
+        "containers": {
+            "total": total_c,
+            "running": running_c,
+            "paused": paused_c,
+            "stopped": stopped_c,
+        },
+        "images": info.get("Images", 0),
+        "cpus": info.get("NCPU", 0),
+        "memory": format_size(info.get("MemTotal")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Backward-Compatible Legacy Tools
+# ---------------------------------------------------------------------------
+
+
+@app.tool(
+    description="List all Docker containers (structured output)",
+    annotations=ToolAnnotations(
+        read_only_hint=True, idempotent_hint=True, open_world_hint=False
+    ),
+)
+@handle_docker_errors
 def list_containers(
     ctx: Context[AppContext],
     all: Annotated[
@@ -254,6 +648,7 @@ def list_containers(
         destructive_hint=False, idempotent_hint=False, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def create_container(
     ctx: Context[AppContext],
     image: ImageName,
@@ -311,6 +706,7 @@ def create_container(
         destructive_hint=False, idempotent_hint=False, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def run_container(
     ctx: Context[AppContext],
     image: ImageName,
@@ -368,6 +764,7 @@ def run_container(
         destructive_hint=True, idempotent_hint=False, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def recreate_container(
     ctx: Context[AppContext],
     image: ImageName,
@@ -384,7 +781,7 @@ def recreate_container(
     auto_remove: AutoRemove = False,
 ) -> dict[str, Any]:
     if container_id is None and name is None:
-        raise ValueError(
+        raise ToolError(
             "container_id or name is required for identifying the container to stop+remove"
         )
     old = _client(ctx).containers.get(container_id or name)
@@ -413,6 +810,7 @@ def recreate_container(
         destructive_hint=False, idempotent_hint=False, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def start_container(
     ctx: Context[AppContext], container_id: ContainerID
 ) -> dict[str, Any]:
@@ -422,11 +820,12 @@ def start_container(
 
 
 @app.tool(
-    description="Fetch logs for a Docker container",
+    description="Fetch logs for a Docker container (structured line list)",
     annotations=ToolAnnotations(
         read_only_hint=True, idempotent_hint=True, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def fetch_container_logs(
     ctx: Context[AppContext],
     container_id: ContainerID,
@@ -435,13 +834,10 @@ def fetch_container_logs(
         Field(description="Number of lines to show from the end"),
     ] = 100,
 ) -> dict[str, list[str]]:
-    return {
-        "logs": _client(ctx)
-        .containers.get(container_id)
-        .logs(tail=tail)
-        .decode("utf-8")
-        .split("\n")
-    }
+    raw = _client(ctx).containers.get(container_id).logs(tail=tail)
+    stdout, stderr = demux_docker_stream(raw)
+    combined = (stdout or "") + (("\n" + stderr) if stderr else "")
+    return {"logs": combined.split("\n")}
 
 
 @app.tool(
@@ -450,6 +846,7 @@ def fetch_container_logs(
         destructive_hint=False, idempotent_hint=False, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def stop_container(
     ctx: Context[AppContext], container_id: ContainerID
 ) -> dict[str, Any]:
@@ -464,6 +861,7 @@ def stop_container(
         destructive_hint=True, idempotent_hint=False, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def remove_container(
     ctx: Context[AppContext],
     container_id: ContainerID,
@@ -475,11 +873,12 @@ def remove_container(
 
 
 @app.tool(
-    description="List Docker images",
+    description="List Docker images (structured output)",
     annotations=ToolAnnotations(
         read_only_hint=True, idempotent_hint=True, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def list_images(
     ctx: Context[AppContext],
     name: Annotated[
@@ -506,6 +905,7 @@ def list_images(
         destructive_hint=False, idempotent_hint=False, open_world_hint=True
     ),
 )
+@handle_docker_errors
 def pull_image(
     ctx: Context[AppContext],
     repository: Annotated[str, Field(description="Image repository")],
@@ -520,6 +920,7 @@ def pull_image(
         destructive_hint=False, idempotent_hint=False, open_world_hint=True
     ),
 )
+@handle_docker_errors
 def push_image(
     ctx: Context[AppContext],
     repository: Annotated[str, Field(description="Image repository")],
@@ -535,6 +936,7 @@ def push_image(
         destructive_hint=False, idempotent_hint=False, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def build_image(
     ctx: Context[AppContext],
     path: Annotated[str, Field(description="Path to build context")],
@@ -551,6 +953,7 @@ def build_image(
         destructive_hint=True, idempotent_hint=False, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def remove_image(
     ctx: Context[AppContext],
     image: Annotated[str, Field(description="Image ID or name")],
@@ -566,6 +969,7 @@ def remove_image(
         read_only_hint=True, idempotent_hint=True, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def list_networks(
     ctx: Context[AppContext],
     filters: Annotated[
@@ -586,6 +990,7 @@ def list_networks(
         destructive_hint=False, idempotent_hint=False, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def create_network(
     ctx: Context[AppContext],
     name: Annotated[str, Field(description="Network name")],
@@ -608,6 +1013,7 @@ def create_network(
         destructive_hint=True, idempotent_hint=False, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def remove_network(
     ctx: Context[AppContext],
     network_id: Annotated[str, Field(description="Network ID or name")],
@@ -623,6 +1029,7 @@ def remove_network(
         read_only_hint=True, idempotent_hint=True, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def list_volumes(ctx: Context[AppContext]) -> list[dict[str, Any]]:
     return [docker_to_dict(volume) for volume in _client(ctx).volumes.list()]
 
@@ -633,6 +1040,7 @@ def list_volumes(ctx: Context[AppContext]) -> list[dict[str, Any]]:
         destructive_hint=False, idempotent_hint=False, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def create_volume(
     ctx: Context[AppContext],
     name: Annotated[str, Field(description="Volume name")],
@@ -650,6 +1058,7 @@ def create_volume(
         destructive_hint=True, idempotent_hint=False, open_world_hint=False
     ),
 )
+@handle_docker_errors
 def remove_volume(
     ctx: Context[AppContext],
     volume_name: Annotated[str, Field(description="Volume name")],
